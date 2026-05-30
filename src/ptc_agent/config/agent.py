@@ -7,6 +7,7 @@ Use src.config.loaders for file-based loading.
 """
 
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -27,6 +28,20 @@ from ptc_agent.config.core import (
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
+
+
+class CredentialSource(StrEnum):
+    """Which credential actually produced an LLM client.
+
+    Distinct from ``ModelSource`` (server-side, classifies the model as
+    SYSTEM/CUSTOM/UNKNOWN). Set by ``resolve_llm_config`` to record the
+    credential that built ``AgentConfig.llm_client``.
+    """
+
+    OAUTH = "oauth"
+    BYOK = "byok"
+    PLATFORM = "platform"
+    NONE = "none"
 
 
 class CompactionConfig(BaseModel):
@@ -236,6 +251,10 @@ class AgentConfig(BaseModel):
     # Runtime data (not from config files)
     llm_definition: LLMDefinition | None = Field(default=None, exclude=True)
     llm_client: Any | None = Field(default=None, exclude=True)  # BaseChatModel instance
+    # Which credential produced ``llm_client``; set by ``resolve_llm_config``.
+    credential_source: CredentialSource = Field(
+        default=CredentialSource.NONE, exclude=True
+    )
     subsidiary_llm_clients: dict[str, Any] = Field(default_factory=dict, exclude=True)
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)  # Pre-resolved fallback instances
     # Forwarded by ``get_llm_client()`` to ``create_llm(cache_key=...)`` for
@@ -490,6 +509,23 @@ class AgentConfig(BaseModel):
 
         ensure_model_in_manifest(self.llm.name)
         return create_llm(self.llm.name, cache_key=self.cache_key)
+
+    def client_for_role(self, role: str, *, fallback_to_main: bool = False):
+        """Return the pre-resolved client for a role, or None.
+
+        Roles: "compaction", "fetch", "subagent:<name>". Returns a
+        ``.model_copy()`` so role-local mutation (e.g. compaction setting
+        ``streaming=False``) never touches the shared main client. With
+        ``fallback_to_main=True`` and no role client, returns a copy of the
+        main client when one exists.
+        """
+        c = self.subsidiary_llm_clients.get(role)
+        if c is not None:
+            return c.model_copy()
+        if not fallback_to_main:
+            return None
+        main = self.llm_client
+        return main.model_copy() if main is not None else None
 
     def to_core_config(self) -> CoreConfig:
         """Convert to CoreConfig for use with SessionManager.

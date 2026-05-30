@@ -8,7 +8,7 @@ user context building, and schedule computation.
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,6 +19,7 @@ from src.server.services.insight_service import (
     InsightService,
     _extract_json_string,
     _extract_structured_output,
+    _llm_extract_fallback,
 )
 
 
@@ -135,7 +136,7 @@ class TestExtractWithFallback:
     )
     async def test_direct_parse_succeeds(self, mock_extract):
         svc = InsightService()
-        result = await svc._extract_with_fallback("some raw text")
+        result = await svc._extract_with_fallback("some raw text", user_id=None)
 
         assert result["headline"] == "Markets rally on strong earnings"
         mock_extract.assert_called_once_with("some raw text")
@@ -152,11 +153,135 @@ class TestExtractWithFallback:
     )
     async def test_direct_fails_llm_fallback_succeeds(self, mock_extract, mock_fallback):
         svc = InsightService()
-        result = await svc._extract_with_fallback("bad raw text")
+        result = await svc._extract_with_fallback("bad raw text", user_id=None)
 
         assert result["headline"] == "Fallback headline"
         mock_extract.assert_called_once_with("bad raw text")
-        mock_fallback.assert_awaited_once_with("bad raw text")
+        mock_fallback.assert_awaited_once_with("bad raw text", user_id=None)
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.insight_service._llm_extract_fallback",
+        new_callable=AsyncMock,
+        return_value=_valid_output(headline="Fallback user headline"),
+    )
+    @patch(
+        "src.server.services.insight_service._extract_structured_output",
+        side_effect=ValueError("Direct JSON parsing failed"),
+    )
+    async def test_extract_with_fallback_threads_user_id(self, mock_extract, mock_fallback):
+        """user_id passed to _extract_with_fallback is forwarded to _llm_extract_fallback."""
+        svc = InsightService()
+        result = await svc._extract_with_fallback("bad raw text", user_id="usr-abc")
+
+        assert result["headline"] == "Fallback user headline"
+        mock_fallback.assert_awaited_once_with("bad raw text", user_id="usr-abc")
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.insight_service._llm_extract_fallback",
+        new_callable=AsyncMock,
+        return_value=_valid_output(headline="Fallback none headline"),
+    )
+    @patch(
+        "src.server.services.insight_service._extract_structured_output",
+        side_effect=ValueError("Direct JSON parsing failed"),
+    )
+    async def test_extract_with_fallback_none_user_id(self, mock_extract, mock_fallback):
+        """user_id=None is forwarded unchanged (system/scheduled path)."""
+        svc = InsightService()
+        result = await svc._extract_with_fallback("bad raw text", user_id=None)
+
+        assert result["headline"] == "Fallback none headline"
+        mock_fallback.assert_awaited_once_with("bad raw text", user_id=None)
+
+
+# ---------------------------------------------------------------------------
+# _llm_extract_fallback
+# ---------------------------------------------------------------------------
+
+class TestLLMExtractFallback:
+    """Test _llm_extract_fallback routes through LLMService.complete."""
+
+    @pytest.mark.asyncio
+    async def test_calls_llm_service_complete_with_user_id(self):
+        """_llm_extract_fallback delegates to LLMService.complete with the supplied user_id."""
+        from src.server.models.market_insight import InsightOutputSchema
+
+        stub_result = MagicMock(spec=InsightOutputSchema)
+        stub_result.model_dump.return_value = _valid_output()
+
+        mock_agent_config = MagicMock()
+
+        with (
+            patch("src.server.app.setup") as mock_setup,
+            patch("src.server.services.llm_service.LLMService") as MockLLMService,
+        ):
+            mock_setup.agent_config = mock_agent_config
+            mock_instance = MagicMock()
+            mock_instance.complete = AsyncMock(return_value=stub_result)
+            MockLLMService.return_value = mock_instance
+
+            result = await _llm_extract_fallback("some raw text", user_id="usr-x")
+
+        # Constructor must receive agent_config from setup
+        ctor_kwargs = MockLLMService.call_args.kwargs
+        assert ctor_kwargs["agent_config"] is mock_agent_config
+        # complete() must be called with user_id, response_schema, mode
+        mock_instance.complete.assert_awaited_once()
+        call_kwargs = mock_instance.complete.call_args.kwargs
+        assert call_kwargs["user_id"] == "usr-x"
+        assert call_kwargs["response_schema"] is InsightOutputSchema
+        assert call_kwargs["mode"] == "flash"
+        assert result == _valid_output()
+
+    @pytest.mark.asyncio
+    async def test_calls_llm_service_complete_with_none_user_id(self):
+        """user_id=None is passed through to LLMService.complete (system/scheduled path)."""
+        from src.server.models.market_insight import InsightOutputSchema
+
+        stub_result = MagicMock(spec=InsightOutputSchema)
+        stub_result.model_dump.return_value = _valid_output()
+
+        mock_agent_config = MagicMock()
+
+        with (
+            patch("src.server.app.setup") as mock_setup,
+            patch("src.server.services.llm_service.LLMService") as MockLLMService,
+        ):
+            mock_setup.agent_config = mock_agent_config
+            mock_instance = MagicMock()
+            mock_instance.complete = AsyncMock(return_value=stub_result)
+            MockLLMService.return_value = mock_instance
+
+            result = await _llm_extract_fallback("some raw text", user_id=None)
+
+        call_kwargs = mock_instance.complete.call_args.kwargs
+        assert call_kwargs["user_id"] is None
+        assert call_kwargs["mode"] == "flash"
+        assert result == _valid_output()
+
+    @pytest.mark.asyncio
+    async def test_no_create_llm_imported(self):
+        """_llm_extract_fallback must not import or call create_llm."""
+        stub_result = MagicMock()
+        stub_result.model_dump.return_value = _valid_output()
+
+        mock_agent_config = MagicMock()
+
+        with (
+            patch("src.server.app.setup") as mock_setup,
+            patch("src.server.services.llm_service.LLMService") as MockLLMService,
+            patch("src.llms.llm.create_llm") as mock_create_llm,
+        ):
+            mock_setup.agent_config = mock_agent_config
+            mock_instance = MagicMock()
+            mock_instance.complete = AsyncMock(return_value=stub_result)
+            MockLLMService.return_value = mock_instance
+
+            await _llm_extract_fallback("some text", user_id="usr-y")
+
+        mock_create_llm.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

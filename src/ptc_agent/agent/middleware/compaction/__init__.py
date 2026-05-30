@@ -19,6 +19,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     compute_absolute_cutoff,
     count_tokens_tiktoken,
     get_effective_messages,
+    resolve_compaction_client,
     strip_base64_from_content,
     strip_base64_from_messages,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "count_tokens_tiktoken",
     "get_effective_messages",
     "offload_tool_args",
+    "resolve_compaction_client",
     "strip_base64_from_content",
     "strip_base64_from_messages",
 ]

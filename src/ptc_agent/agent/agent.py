@@ -43,6 +43,7 @@ from ptc_agent.agent.middleware import (
     TodoWriteMiddleware,
     SkillsMiddleware,
     CompactionMiddleware,
+    resolve_compaction_client,
     LargeResultEvictionMiddleware,
     SteeringMiddleware,
     SubagentSteeringMiddleware,
@@ -595,6 +596,7 @@ class PTCAgent:
             user_profile=user_profile,
             current_time=current_time,
             thread_id=short_thread_id,
+            config=self.config,
         )
         subagents = create_subagents(
             registry=subagent_registry,
@@ -648,16 +650,9 @@ class PTCAgent:
         compaction_config = self.config.compaction.model_dump()
         if self.config.llm and self.config.llm.compaction:
             compaction_config["llm"] = self.config.llm.compaction
-            compaction_client = self.config.subsidiary_llm_clients.get("compaction")
-            if compaction_client:
-                compaction_config["_llm_client"] = compaction_client
-            elif self.config.llm_client:
-                # Copy so CompactionMiddleware.from_config() can set
-                # streaming=False without mutating the main agent's model.
-                compaction_config["_llm_client"] = self.config.llm_client.model_copy()
-        elif self.config.llm_client:
-            # No dedicated compaction model; fall back to main agent LLM
-            compaction_config["_llm_client"] = self.config.llm_client.model_copy()
+        client = resolve_compaction_client(self.config)
+        if client is not None:
+            compaction_config["_llm_client"] = client
         compaction = CompactionMiddleware.from_config(config=compaction_config, backend=backend)
 
         model_resilience = self._build_model_resilience_middleware()

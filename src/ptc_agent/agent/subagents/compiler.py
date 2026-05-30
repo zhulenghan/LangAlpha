@@ -9,7 +9,7 @@ The compiler handles:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -17,6 +17,9 @@ from ptc_agent.agent.middleware.skills.content import load_skill_content
 from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 from ptc_agent.agent.prompts import build_tool_summary_from_registry, get_loader
 from ptc_agent.agent.subagents.definition import SubagentDefinition
+
+if TYPE_CHECKING:
+    from ptc_agent.config.agent import AgentConfig
 
 logger = structlog.get_logger(__name__)
 
@@ -67,6 +70,7 @@ class SubagentCompiler:
         user_profile: dict[str, Any] | None = None,
         current_time: str | None = None,
         thread_id: str = "",
+        config: AgentConfig | None = None,
     ) -> None:
         self._sandbox = sandbox
         self._mcp_registry = mcp_registry
@@ -74,6 +78,7 @@ class SubagentCompiler:
         self._user_profile = user_profile
         self._current_time = current_time
         self._thread_id = thread_id
+        self._config = config
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -89,8 +94,15 @@ class SubagentCompiler:
             "tools": tools,
         }
 
-        if definition.model is not None:
-            result["model"] = definition.model
+        # Resolved client (credentialed user) overrides the string model name.
+        resolved = None
+        if self._config is not None:
+            resolved = self._config.client_for_role(
+                f"subagent:{definition.name}", fallback_to_main=False
+            )
+        model = resolved if resolved is not None else definition.model
+        if model is not None:
+            result["model"] = model
 
         return result
 

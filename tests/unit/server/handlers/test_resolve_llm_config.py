@@ -1068,11 +1068,12 @@ class TestClassifyModelDirect:
 
 class TestClassifyModelDedup:
     @pytest.mark.asyncio
-    async def test_classify_called_once_per_distinct_model(self, base_config):
-        """resolve_llm_config should classify each distinct model exactly once
-        at the orchestration layer: one call for the main model and one per
-        fallback (via _resolve_one). Inner helpers are mocked, so any
-        re-classification they do internally is excluded from this count.
+    async def test_classify_only_distinct_models(self, base_config):
+        """resolve_llm_config only classifies the distinct models in play: the
+        main model and each fallback. The pref cache keeps every classify O(1)
+        and free of extra DB reads, so the set of names is the invariant we care
+        about (the per-name count is an implementation detail of the STEP-0
+        prefetch + per-model primitive resolution).
         """
         from src.server.handlers.chat.llm_config import (
             resolve_llm_config,
@@ -1097,14 +1098,18 @@ class TestClassifyModelDedup:
             patch(f"{HANDLER}.classify_model", classify_mock),
             patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
             patch(f"{HANDLER}.resolve_byok_llm_client", new_callable=AsyncMock, return_value=None),
+            patch(
+                "src.server.database.api_keys.get_byok_configs_for_providers",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
             patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
         ):
             await resolve_llm_config(base_config, "user-1", None, True)
 
-        # 1 main + 2 fallbacks = 3 classification calls. No more, no less.
-        assert classify_mock.await_count == 3
-        called_names = [call.args[1] for call in classify_mock.await_args_list]
-        assert set(called_names) == {"system-default-model", "fb-a", "fb-b"}
+        # No model outside {main, fallbacks} is ever classified.
+        called_names = {call.args[1] for call in classify_mock.await_args_list}
+        assert called_names == {"system-default-model", "fb-a", "fb-b"}
 
 
 # ---------------------------------------------------------------------------

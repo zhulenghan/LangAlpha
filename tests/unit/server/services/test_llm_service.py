@@ -9,6 +9,8 @@ Covers:
 - ``response_schema=SomeModel`` returns a pydantic instance.
 - ``return_token_usage=True`` returns a tuple.
 - ``request_model`` override reaches both code paths (None + user_id).
+- ``platform_key_fallback`` log fires for PLATFORM/NONE credential sources
+  and is suppressed for OAUTH/BYOK and the ``user_id=None`` system path.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
+from ptc_agent.config.agent import CredentialSource
 from src.server.services.llm_service import LLMService
 
 
@@ -129,6 +132,7 @@ class TestUserIdProvided:
         resolved_config = SimpleNamespace(
             llm=SimpleNamespace(flash="flash-resolved", name="name-resolved"),
             llm_client=resolved_llm,
+            credential_source=CredentialSource.BYOK,
         )
 
         with (
@@ -187,6 +191,7 @@ class TestUserIdProvided:
         resolved_config = SimpleNamespace(
             llm=SimpleNamespace(flash="flash-resolved", name="name-resolved"),
             llm_client=None,
+            credential_source=CredentialSource.NONE,
         )
         fake_llm = MagicMock(name="fallback_llm")
 
@@ -320,6 +325,7 @@ class TestRequestModelOverride:
         resolved_config = SimpleNamespace(
             llm=SimpleNamespace(flash="flash-resolved", name="name-resolved"),
             llm_client=MagicMock(),
+            credential_source=CredentialSource.BYOK,
         )
 
         with (
@@ -341,3 +347,142 @@ class TestRequestModelOverride:
             )
 
         assert mock_resolve.await_args.kwargs["request_model"] == "custom-model-slug"
+
+
+# ---------------------------------------------------------------------------
+# platform_key_fallback signal — driven by credential_source, not llm is None
+# ---------------------------------------------------------------------------
+
+
+def _make_resolved_config(
+    *,
+    credential_source: CredentialSource,
+    llm_client=None,
+    flash: str = "flash-model",
+    name: str = "name-model",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        llm=SimpleNamespace(flash=flash, name=name),
+        llm_client=llm_client,
+        credential_source=credential_source,
+    )
+
+
+class TestPlatformKeyFallbackSignal:
+    """``platform_key_fallback`` must fire for PLATFORM and NONE, not for OAUTH/BYOK."""
+
+    async def _run(self, service, *, credential_source, llm_client):
+        """Helper: patch resolve_llm_config with given source/client, run complete()."""
+        resolved_config = _make_resolved_config(
+            credential_source=credential_source, llm_client=llm_client
+        )
+        fake_llm = MagicMock(name="fake_llm")
+        with (
+            patch(
+                "src.server.services.llm_service.resolve_llm_config",
+                new_callable=AsyncMock,
+                return_value=resolved_config,
+            ),
+            patch(
+                "src.server.services.llm_service.create_llm",
+                return_value=fake_llm,
+            ),
+            patch(
+                "src.server.services.llm_service.make_api_call",
+                new_callable=AsyncMock,
+                return_value="ok",
+            ),
+        ):
+            await service.complete(user_id="user-a", user_prompt="test", mode="flash")
+
+    @pytest.mark.asyncio
+    async def test_platform_eager_emits_signal(self):
+        """PLATFORM + llm_client SET (eager case missed by the old code) → signal fires."""
+        agent_config = _make_agent_config()
+        mock_logger = MagicMock()
+        service = LLMService(agent_config=agent_config, logger=mock_logger)
+
+        eager_client = MagicMock(name="eager_platform_client")
+        await self._run(
+            service,
+            credential_source=CredentialSource.PLATFORM,
+            llm_client=eager_client,
+        )
+
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args
+        assert call_args.args[0] == "llm_service.platform_key_fallback"
+        extra = call_args.kwargs["extra"]
+        assert extra["user_id"] == "user-a"
+        assert extra["credential_source"] == str(CredentialSource.PLATFORM)
+
+    @pytest.mark.asyncio
+    async def test_none_lazy_emits_signal(self):
+        """NONE + llm_client None (lazy create_llm path) → signal fires."""
+        agent_config = _make_agent_config()
+        mock_logger = MagicMock()
+        service = LLMService(agent_config=agent_config, logger=mock_logger)
+
+        await self._run(
+            service,
+            credential_source=CredentialSource.NONE,
+            llm_client=None,
+        )
+
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args
+        assert call_args.args[0] == "llm_service.platform_key_fallback"
+        extra = call_args.kwargs["extra"]
+        assert extra["credential_source"] == str(CredentialSource.NONE)
+
+    @pytest.mark.asyncio
+    async def test_byok_suppresses_signal(self):
+        """BYOK → no platform log."""
+        agent_config = _make_agent_config()
+        mock_logger = MagicMock()
+        service = LLMService(agent_config=agent_config, logger=mock_logger)
+
+        await self._run(
+            service,
+            credential_source=CredentialSource.BYOK,
+            llm_client=MagicMock(name="byok_client"),
+        )
+
+        mock_logger.info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_oauth_suppresses_signal(self):
+        """OAUTH → no platform log."""
+        agent_config = _make_agent_config()
+        mock_logger = MagicMock()
+        service = LLMService(agent_config=agent_config, logger=mock_logger)
+
+        await self._run(
+            service,
+            credential_source=CredentialSource.OAUTH,
+            llm_client=MagicMock(name="oauth_client"),
+        )
+
+        mock_logger.info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_id_none_system_path_suppresses_signal(self):
+        """user_id=None (system task) → no resolution → no platform log."""
+        agent_config = _make_agent_config(flash="sys-flash-model")
+        mock_logger = MagicMock()
+        service = LLMService(agent_config=agent_config, logger=mock_logger)
+
+        with (
+            patch(
+                "src.server.services.llm_service.create_llm",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "src.server.services.llm_service.make_api_call",
+                new_callable=AsyncMock,
+                return_value="ok",
+            ),
+        ):
+            await service.complete(user_id=None, user_prompt="system task")
+
+        mock_logger.info.assert_not_called()

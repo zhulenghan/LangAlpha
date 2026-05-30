@@ -173,24 +173,20 @@ def _extract_structured_output(raw_text: str) -> dict:
     )
 
 
-async def _llm_extract_fallback(raw_text: str) -> dict:
-    """Extract structured insight data via a separate LLM call with response_schema.
+async def _llm_extract_fallback(raw_text: str, user_id: str | None) -> dict:
+    """Extract structured insight data via the canonical one-shot LLM wrapper.
 
-    Uses make_api_call with response_schema for native structured output,
-    which includes its own retry + manual JSON parse fallback chain.
+    Routes through ``LLMService.complete`` so BYOK / OAuth credentials are
+    respected (or the platform default is used when ``user_id`` is None).
+    ``user_id`` is required so callers must be explicit about the platform path.
     """
-    from src.llms import create_llm
-    from src.llms.api_call import make_api_call
     from src.server.models.market_insight import InsightOutputSchema
-
+    from src.server.services.llm_service import LLMService
     from src.server.app import setup
 
-    config = setup.agent_config
-    flash_model_name = config.llm.flash if config and config.llm else "claude-haiku-4-5-20251001"
-
-    llm = create_llm(flash_model_name)
-    result = await make_api_call(
-        llm,
+    svc = LLMService(agent_config=setup.agent_config, logger=logger)
+    result = await svc.complete(
+        user_id=user_id,
         system_prompt=(
             "You are a structured data extractor. Extract the market insight data "
             "from the provided text into the required JSON schema. "
@@ -198,6 +194,7 @@ async def _llm_extract_fallback(raw_text: str) -> dict:
         ),
         user_prompt=raw_text,
         response_schema=InsightOutputSchema,
+        mode="flash",
     )
     return result.model_dump() if hasattr(result, "model_dump") else dict(result)
 
@@ -437,7 +434,7 @@ class InsightService:
                 _run_flash_agent(prompt + "\n\n" + _JSON_GUIDELINES, user_id=user_id),
                 timeout=self._generation_timeout,
             )
-            parsed = await self._extract_with_fallback(raw_text)
+            parsed = await self._extract_with_fallback(raw_text, user_id=user_id)
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
             await insight_db.complete_market_insight(
@@ -729,7 +726,7 @@ class InsightService:
                 _run_flash_agent(instruction + "\n\n" + _JSON_GUIDELINES, user_id=system_user_id),
                 timeout=self._generation_timeout,
             )
-            parsed = await self._extract_with_fallback(raw_text)
+            parsed = await self._extract_with_fallback(raw_text, user_id=system_user_id)
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
             await insight_db.complete_market_insight(
@@ -774,13 +771,13 @@ class InsightService:
             except Exception:
                 logger.warning(f"[MARKET_INSIGHT] Failed to mark {insight_id} as failed")
 
-    async def _extract_with_fallback(self, raw_text: str) -> dict:
+    async def _extract_with_fallback(self, raw_text: str, user_id: str | None) -> dict:
         """Extract structured output from raw text, falling back to LLM if direct parse fails."""
         try:
             return _extract_structured_output(raw_text)
         except ValueError:
             logger.info("[MARKET_INSIGHT] Direct JSON parse failed, trying LLM fallback")
-            return await _llm_extract_fallback(raw_text)
+            return await _llm_extract_fallback(raw_text, user_id=user_id)
 
 
 class InsightAlreadyGeneratingError(Exception):

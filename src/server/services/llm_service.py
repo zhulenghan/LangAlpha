@@ -15,10 +15,12 @@ Two code paths:
   ``agent_config.llm.flash`` (or ``request_model``) with platform
   credentials. No DB hit.
 - ``user_id="..."`` — full user-aware resolution through
-  ``resolve_llm_config``. If that function returns a config whose
-  ``llm_client`` is ``None`` (no BYOK / OAuth configured), we fall back to
-  ``create_llm(effective_model)`` on the resolved model name so the call
-  still goes through.
+  ``resolve_llm_config``. A ``platform_key_fallback`` log is emitted
+  whenever ``credential_source`` is not OAUTH or BYOK (i.e. the user's own
+  credential did NOT pay for the call). This fires for both the eager-PLATFORM
+  case (``llm_client`` already set by resolver) and the lazy-NONE case
+  (``llm_client`` is None → ``create_llm`` fallback). It is the seam a future
+  deduction hook will read.
 
 Memo metadata generation is the first caller; thread titles, follow-up
 suggestions, hint messages, and the insight-service fallback are the
@@ -35,6 +37,7 @@ from typing import Any, Literal, Type, TypeVar
 
 from pydantic import BaseModel
 
+from ptc_agent.config.agent import CredentialSource
 from src.llms.api_call import make_api_call
 from src.llms.llm import create_llm
 from src.server.handlers.chat.llm_config import _MODE_MODEL_MAP, resolve_llm_config
@@ -88,19 +91,28 @@ class LLMService:
                 fast_mode=None,
             )
             llm = resolved_config.llm_client
+            model_field, _ = _MODE_MODEL_MAP[mode]
+            effective_model = (
+                getattr(resolved_config.llm, model_field, None)
+                or resolved_config.llm.name
+            )
             if llm is None:
                 # No BYOK / OAuth configured and no reasoning override — fall
                 # back to a platform-keyed client on the resolved model name.
-                model_field, _ = _MODE_MODEL_MAP[mode]
-                effective_model = (
-                    getattr(resolved_config.llm, model_field, None)
-                    or resolved_config.llm.name
-                )
+                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
+            if resolved_config.credential_source not in (
+                CredentialSource.OAUTH,
+                CredentialSource.BYOK,
+            ):
                 self._logger.info(
                     "llm_service.platform_key_fallback",
-                    extra={"user_id": user_id, "model": effective_model, "mode": mode},
+                    extra={
+                        "user_id": user_id,
+                        "model": effective_model,
+                        "mode": mode,
+                        "credential_source": str(resolved_config.credential_source),
+                    },
                 )
-                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
 
         return await make_api_call(
             llm,

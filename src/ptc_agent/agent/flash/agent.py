@@ -18,6 +18,7 @@ from ptc_agent.agent.middleware import (
     ToolErrorHandlingMiddleware,
     ToolResultNormalizationMiddleware,
     CompactionMiddleware,
+    resolve_compaction_client,
     SkillsMiddleware,
     AskUserMiddleware,
 )
@@ -242,13 +243,9 @@ class FlashAgent:
         if self.config.llm.compaction:
             compaction_config = self.config.compaction.model_dump()
             compaction_config["llm"] = self.config.llm.compaction
-            compaction_client = self.config.subsidiary_llm_clients.get("compaction")
-            if compaction_client:
-                compaction_config["_llm_client"] = compaction_client
-            elif self.config.llm_client:
-                # Copy so CompactionMiddleware.from_config() can set
-                # streaming=False without mutating the main agent's model.
-                compaction_config["_llm_client"] = self.config.llm_client.model_copy()
+            client = resolve_compaction_client(self.config)
+            if client is not None:
+                compaction_config["_llm_client"] = client
         compaction = CompactionMiddleware.from_config(config=compaction_config, backend=None)
         if compaction is not None:
             main_middleware.append(compaction)

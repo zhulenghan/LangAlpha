@@ -61,6 +61,7 @@ from .compaction import (
     CompactionMiddleware,
     DEFAULT_SUMMARY_PROMPT,
     count_tokens_tiktoken,
+    resolve_compaction_client,
 )
 
 # Skills middleware (registry + dynamic loader)
@@ -148,6 +149,7 @@ __all__ = [
     "CompactionMiddleware",
     "DEFAULT_SUMMARY_PROMPT",
     "count_tokens_tiktoken",
+    "resolve_compaction_client",
     # Skills
     "SkillsMiddleware",
     # Large result eviction

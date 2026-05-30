@@ -1,10 +1,12 @@
 """Token counting, prompt template, and truncation utilities for compaction."""
 
+from __future__ import annotations
+
 import logging
 import re
 import uuid
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import tiktoken
 
@@ -24,7 +26,26 @@ from ptc_agent.agent.middleware.compaction.types import (
     TRUNCATABLE_TOOLS,
 )
 
+if TYPE_CHECKING:
+    from ptc_agent.config.agent import AgentConfig
+
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Compaction client resolution
+# =============================================================================
+
+
+def resolve_compaction_client(config: AgentConfig) -> Any | None:
+    """Return the compaction LLM client (role-resolved or main-copy), or None.
+
+    With a dedicated compaction model, use the pre-resolved role client
+    (credentialed users) or None (platform users keep the cheap name-based
+    model). Without one, fall back to a copy of the main client.
+    """
+    has_compaction_model = bool(config.llm and config.llm.compaction)
+    return config.client_for_role("compaction", fallback_to_main=not has_compaction_model)
 
 
 # =============================================================================
