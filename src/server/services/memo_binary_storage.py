@@ -1,7 +1,7 @@
 """Object-storage adapter for memo binaries (e.g. original PDF bytes).
 
 Thin wrapper over ``src.utils.storage`` that routes memo binaries to the
-configured object storage (Cloudflare R2, Tencent COS, AWS S3, MinIO...)
+configured object storage (Cloudflare R2, AWS S3, MinIO...)
 when one is configured, and otherwise signals the caller to fall back to
 inline base64 in the store value.
 
@@ -28,7 +28,7 @@ from src.utils.storage import (
 logger = logging.getLogger(__name__)
 
 # Storage identifier stamped into ``binary_ref``. Kept stable across providers
-# (R2/S3/COS) because the adapter is what knows how to fetch it back — the
+# (R2/S3/etc.) because the adapter is what knows how to fetch it back — the
 # caller never needs to vary behavior on this value.
 _BINARY_STORAGE_ID = "r2"
 
@@ -56,7 +56,7 @@ class MemoBinaryFetchError(MemoBinaryStorageError):
 def is_configured() -> bool:
     """Return True iff an object-storage backend is usable for memo binaries.
 
-    Every supported provider (R2, S3, COS, Alibaba OSS) now exposes
+    Every supported provider (R2, S3, Alibaba OSS) now exposes
     ``upload_bytes`` + ``get_bytes`` + ``delete_object``, so any enabled
     backend can round-trip memo binaries.
 

@@ -1,6 +1,6 @@
 """Unified cloud storage upload module.
 
-Supports any S3-compatible service (AWS S3, Cloudflare R2, Tencent COS, MinIO, etc.)
+Supports any S3-compatible service (AWS S3, Cloudflare R2, MinIO, etc.)
 and Alibaba Cloud OSS via a single interface.
 
 Configuration priority:
@@ -9,7 +9,7 @@ Configuration priority:
     3. Default: "none" (disabled)
 
 Provider options:
-    provider: "s3"    # Any S3-compatible service (S3, R2, COS, MinIO)
+    provider: "s3"    # Any S3-compatible service (S3, R2, MinIO, etc.)
     provider: "oss"   # Alibaba Cloud OSS
     provider: "none"  # Disable uploads
 

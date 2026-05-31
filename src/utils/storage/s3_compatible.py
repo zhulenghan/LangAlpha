@@ -1,7 +1,7 @@
 """S3-compatible cloud storage uploader.
 
 A single module for all S3-compatible services: AWS S3, Cloudflare R2,
-Tencent COS, MinIO, and any other service supporting the S3 API.
+MinIO, and any other service supporting the S3 API.
 
 The only difference between providers is configuration (endpoint, credentials).
 All use boto3 under the hood.
@@ -19,13 +19,19 @@ Environment Variables:
     STORAGE_MAX_UPLOAD_SIZE   - Max upload size in bytes (default: 10MB)
     STORAGE_CONNECT_TIMEOUT_S - boto3 connect timeout in seconds (default: 5)
     STORAGE_READ_TIMEOUT_S    - boto3 read timeout in seconds (default: 30)
+    STORAGE_ADDRESSING_STYLE  - Bucket addressing: virtual (default) | path | auto
 
-Provider-specific examples:
-    AWS S3:      No endpoint needed, just credentials + bucket + region
+Endpoint / addressing:
+    AWS S3:        No endpoint needed, just credentials + bucket + region
     Cloudflare R2: STORAGE_ENDPOINT_URL=https://{account_id}.r2.cloudflarestorage.com
                    STORAGE_REGION=auto
-    Tencent COS:   STORAGE_ENDPOINT_URL=https://cos.{region}.myqcloud.com
-    MinIO:         STORAGE_ENDPOINT_URL=http://localhost:9000
+    MinIO:         STORAGE_ENDPOINT_URL=http://localhost:9000  + STORAGE_ADDRESSING_STYLE=path
+    Other S3-compatible: STORAGE_ENDPOINT_URL=https://{bare-host}  (no bucket subdomain)
+
+Most cloud S3-compatible services use virtual-hosted addressing (the default);
+self-hosted / path-only backends (e.g. MinIO) require STORAGE_ADDRESSING_STYLE=path.
+For a custom endpoint, give the bare host with no bucket subdomain — embedding the
+bucket double-prefixes object keys under virtual addressing.
 """
 
 import base64
@@ -65,6 +71,26 @@ def _get_content_type(key: str) -> str | None:
     return mime_type
 
 
+_VALID_ADDRESSING_STYLES = {"virtual", "path", "auto"}
+
+
+def _resolve_addressing_style() -> str:
+    """Read STORAGE_ADDRESSING_STYLE, trimmed and validated; default 'virtual'.
+
+    Warns on an unrecognized value rather than silently coercing it, so a typo
+    or stray whitespace on a path-only backend surfaces instead of reintroducing
+    key doubling.
+    """
+    raw = (os.getenv("STORAGE_ADDRESSING_STYLE") or "virtual").strip().lower()
+    if raw not in _VALID_ADDRESSING_STYLES:
+        logger.warning(
+            "Invalid STORAGE_ADDRESSING_STYLE=%r; falling back to 'virtual' (valid: virtual, path, auto)",
+            raw,
+        )
+        return "virtual"
+    return raw
+
+
 class StorageConfig:
     """Storage configuration loaded from environment variables.
 
@@ -85,6 +111,13 @@ class StorageConfig:
 
     CONNECT_TIMEOUT_S = int(os.getenv("STORAGE_CONNECT_TIMEOUT_S", "5"))
     READ_TIMEOUT_S = int(os.getenv("STORAGE_READ_TIMEOUT_S", "30"))
+
+    # boto3 bucket addressing. Defaults to "virtual" because most cloud
+    # S3-compatible services require/prefer virtual-hosted addressing, whereas
+    # boto3's own default ("path" for custom endpoints) double-prefixes keys
+    # against an endpoint that already embeds the bucket. Self-hosted / path-only
+    # backends (e.g. MinIO) should set STORAGE_ADDRESSING_STYLE=path.
+    ADDRESSING_STYLE = _resolve_addressing_style()
 
     @classmethod
     def get_public_url_base(cls) -> str:
@@ -113,6 +146,7 @@ def _get_client() -> Any:
         "region_name": StorageConfig.REGION,
         "config": Config(
             signature_version="s3v4",
+            s3={"addressing_style": StorageConfig.ADDRESSING_STYLE},
             retries={"max_attempts": 3, "mode": "standard"},
             connect_timeout=StorageConfig.CONNECT_TIMEOUT_S,
             read_timeout=StorageConfig.READ_TIMEOUT_S,
