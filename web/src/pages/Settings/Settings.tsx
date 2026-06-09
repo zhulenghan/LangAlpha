@@ -21,6 +21,7 @@ import type { ByokProvider, CustomModelEntry } from '@/components/model/types';
 import { useAllModels } from '@/hooks/useAllModels';
 import type { CompactionProfileName } from '@/hooks/useAllModels';
 import { useDebouncedSave } from '@/hooks/useDebouncedSave';
+import { isSupported, setLocaleCookie } from '@/lib/locale';
 import './Settings.css';
 
 interface CodexDeviceCode {
@@ -506,9 +507,9 @@ function Settings() {
 
   const handleLocaleChange = (newLocale: string) => {
     setLocale(newLocale);
-    if (newLocale === 'en-US' || newLocale === 'zh-CN') {
+    if (isSupported(newLocale)) {
       i18n.changeLanguage(newLocale);
-      localStorage.setItem('locale', newLocale);
+      setLocaleCookie(newLocale);
     }
     userInfoRef.current = { ...userInfoRef.current, locale: newLocale };
     flushUserInfoSave();

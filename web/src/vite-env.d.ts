@@ -7,7 +7,9 @@ interface ImportMetaEnv {
   readonly VITE_SUPABASE_PUBLISHABLE_KEY?: string;
   readonly VITE_AUTH_USER_ID?: string;
   readonly VITE_CDN_BASE?: string;
-  readonly VITE_AUTH_COOKIE_DOMAIN?: string;
+  // Parent domain shared by all first-party cookies (auth + locale). Unset →
+  // host-only (the default); set to a parent domain for cross-subdomain SSO.
+  readonly VITE_COOKIE_DOMAIN?: string;
 }
 interface ImportMeta {
   readonly env: ImportMetaEnv;
