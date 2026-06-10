@@ -15,7 +15,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from src.server.database.oauth_tokens import get_oauth_tokens
+from src.server.services.robinhood_oauth import get_valid_token
 
 from .client import RobinhoodMCPError, call_tool
 
@@ -26,18 +26,18 @@ from .client import RobinhoodMCPError, call_tool
 
 
 async def _get_token(config: RunnableConfig) -> str:
-    """Fetch the Robinhood access token for the calling user."""
+    """Fetch a valid Robinhood access token for the calling user."""
     configurable = config.get("configurable", {})
     user_id = configurable.get("user_id")
     if not user_id:
         raise ValueError("user_id missing from RunnableConfig")
-    row = await get_oauth_tokens(user_id, "robinhood")
-    if not row or not row.get("access_token"):
+    result = await get_valid_token(user_id)
+    if not result:
         raise RobinhoodMCPError(
             "Robinhood account not connected. "
             "Please connect your Robinhood account first."
         )
-    return row["access_token"]
+    return result["access_token"]
 
 
 def _args(**kwargs: Any) -> dict[str, Any]:
