@@ -1,5 +1,5 @@
 """
-OAuth Router — Connect external OAuth providers (ChatGPT Codex, Claude).
+OAuth Router — Connect external OAuth providers (ChatGPT Codex, Claude, Robinhood).
 
 Codex — Device Code Flow (RFC 8628):
 - POST   /api/v1/oauth/codex/device/initiate — Start device code flow
@@ -12,6 +12,12 @@ Claude — PKCE Authorization Code Flow:
 - POST   /api/v1/oauth/claude/callback        — Exchange code#state for tokens
 - GET    /api/v1/oauth/claude/status           — Check connection status
 - DELETE /api/v1/oauth/claude                  — Disconnect (delete tokens)
+
+Robinhood — PKCE Authorization Code Flow (MCP OAuth, dynamic client registration):
+- POST   /api/v1/oauth/robinhood/initiate     — Register client, generate PKCE + authorize URL
+- GET    /api/v1/oauth/robinhood/callback     — Browser redirect endpoint, exchange code for tokens
+- GET    /api/v1/oauth/robinhood/status       — Check connection status
+- DELETE /api/v1/oauth/robinhood              — Disconnect (delete tokens)
 """
 
 import json
@@ -35,6 +41,11 @@ from src.server.services.claude_oauth import (
     exchange_code as claude_exchange_code,
     generate_authorize_url as claude_generate_authorize_url,
     parse_callback_input as claude_parse_callback_input,
+)
+from src.server.services.robinhood_oauth import (
+    ROBINHOOD_PROVIDER,
+    exchange_code as robinhood_exchange_code,
+    generate_authorize_url as robinhood_generate_authorize_url,
 )
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
@@ -324,4 +335,171 @@ async def claude_disconnect(user_id: CurrentUserId):
     except Exception:
         pass
     logger.info(f"[oauth] Claude disconnected for user_id={user_id}")
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Robinhood OAuth — PKCE Authorization Code Flow (MCP dynamic client registration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _robinhood_redirect_uri(request) -> str:
+    """Build the callback URI from the incoming request's base URL."""
+    from src.config.env import SERVER_BASE_URL
+    base = SERVER_BASE_URL.rstrip("/")
+    return f"{base}/api/v1/oauth/robinhood/callback"
+
+
+# ─── Initiate ────────────────────────────────────────────────────────────────
+
+@router.post("/robinhood/initiate")
+async def robinhood_initiate(user_id: CurrentUserId, request=None):
+    """Register a dynamic client, generate PKCE, return authorize URL.
+
+    Frontend should open the URL in a popup or new tab. Robinhood redirects
+    back to /robinhood/callback which closes the window and notifies the opener.
+    """
+    from fastapi import Request
+    from src.config.env import SERVER_BASE_URL
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise HTTPException(status_code=503, detail="Cache unavailable for OAuth")
+
+    redirect_uri = f"{SERVER_BASE_URL.rstrip('/')}/api/v1/oauth/robinhood/callback"
+
+    try:
+        authorize_url, client_id, verifier, state = await robinhood_generate_authorize_url(
+            redirect_uri
+        )
+    except Exception as e:
+        logger.error(f"[oauth] Robinhood initiate failed for user_id={user_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to register Robinhood OAuth client")
+
+    # Store state → {user_id, client_id, verifier} in Redis (10-min TTL)
+    await cache.client.set(
+        f"oauth:robinhood:state:{state}",
+        json.dumps({"user_id": user_id, "client_id": client_id, "verifier": verifier}),
+        ex=600,
+    )
+
+    logger.info(f"[oauth] Robinhood OAuth initiated for user_id={user_id}")
+    return {"authorize_url": authorize_url}
+
+
+# ─── Callback (browser redirect) ─────────────────────────────────────────────
+
+_CALLBACK_SUCCESS_HTML = """<!DOCTYPE html>
+<html><head><title>Connected</title></head><body>
+<p>Robinhood connected! You can close this tab.</p>
+<script>
+  if (window.opener) {{
+    window.opener.postMessage({{type: "robinhood_oauth_success"}}, "*");
+    window.close();
+  }}
+</script>
+</body></html>"""
+
+_CALLBACK_ERROR_HTML = """<!DOCTYPE html>
+<html><head><title>Error</title></head><body>
+<p>Authorization failed: {error}</p>
+<script>
+  if (window.opener) {{
+    window.opener.postMessage({{type: "robinhood_oauth_error", error: "{error}"}}, "*");
+    window.close();
+  }}
+</script>
+</body></html>"""
+
+
+@router.get("/robinhood/callback", include_in_schema=False)
+async def robinhood_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    """Handle Robinhood's redirect after user authorization.
+
+    This is a browser-facing endpoint (no auth header). Uses state to look up
+    the pending session from Redis, exchanges the code for tokens, then returns
+    an HTML page that notifies the opener window and closes itself.
+    """
+    from fastapi.responses import HTMLResponse
+    from src.config.env import SERVER_BASE_URL
+    from src.utils.cache.redis_cache import get_cache_client
+
+    def error_page(msg: str) -> HTMLResponse:
+        return HTMLResponse(_CALLBACK_ERROR_HTML.format(error=msg), status_code=400)
+
+    if error:
+        logger.warning(f"[oauth] Robinhood callback error: {error}")
+        return error_page(error)
+
+    if not code or not state:
+        return error_page("Missing code or state parameter")
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        return error_page("Cache unavailable")
+
+    raw = await cache.client.get(f"oauth:robinhood:state:{state}")
+    if not raw:
+        return error_page("Unknown or expired state. Please try connecting again.")
+
+    session = json.loads(raw)
+    user_id   = session["user_id"]
+    client_id = session["client_id"]
+    verifier  = session["verifier"]
+
+    redirect_uri = f"{SERVER_BASE_URL.rstrip('/')}/api/v1/oauth/robinhood/callback"
+
+    try:
+        tokens = await robinhood_exchange_code(code, verifier, client_id, redirect_uri)
+    except Exception as e:
+        logger.error(f"[oauth] Robinhood token exchange failed for user_id={user_id}: {e}")
+        return error_page("Token exchange failed. Please try again.")
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=tokens.get("expires_in", 86400))
+
+    await upsert_oauth_tokens(
+        user_id=user_id,
+        provider=ROBINHOOD_PROVIDER,
+        access_token=tokens["access_token"],
+        refresh_token=tokens["refresh_token"],
+        account_id=client_id,  # stored for use during token refresh
+        email=None,
+        plan_type=None,
+        expires_at=expires_at,
+    )
+
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+
+    await cache.client.delete(f"oauth:robinhood:state:{state}")
+
+    logger.info(f"[oauth] Robinhood connected for user_id={user_id}")
+    return HTMLResponse(_CALLBACK_SUCCESS_HTML)
+
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+@router.get("/robinhood/status")
+async def robinhood_status(user_id: CurrentUserId):
+    """Return Robinhood connection status."""
+    status = await get_oauth_status(user_id, ROBINHOOD_PROVIDER)
+    # account_id holds client_id internally — don't expose it
+    status["account_id"] = None
+    return status
+
+
+# ─── Disconnect ──────────────────────────────────────────────────────────────
+
+@router.delete("/robinhood")
+async def robinhood_disconnect(user_id: CurrentUserId):
+    """Delete stored Robinhood OAuth tokens."""
+    await delete_oauth_tokens(user_id, ROBINHOOD_PROVIDER)
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+    logger.info(f"[oauth] Robinhood disconnected for user_id={user_id}")
     return {"success": True}
