@@ -21,10 +21,11 @@ Robinhood — PKCE Authorization Code Flow (MCP OAuth, dynamic client registrati
 """
 
 import json
+import urllib.parse
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from src.server.utils.api import CurrentUserId
@@ -352,13 +353,14 @@ def _robinhood_redirect_uri(request) -> str:
 # ─── Initiate ────────────────────────────────────────────────────────────────
 
 @router.post("/robinhood/initiate")
-async def robinhood_initiate(user_id: CurrentUserId, request=None):
+async def robinhood_initiate(user_id: CurrentUserId, request: Request):
     """Register a dynamic client, generate PKCE, return authorize URL.
 
-    Frontend should open the URL in a popup or new tab. Robinhood redirects
-    back to /robinhood/callback which closes the window and notifies the opener.
+    Frontend opens the URL in a popup. Robinhood redirects back to
+    /robinhood/callback, which redirects to the frontend's OAuth callback page
+    so the popup is same-origin with the opener and can communicate via
+    BroadcastChannel.
     """
-    from fastapi import Request
     from src.config.env import SERVER_BASE_URL
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -368,6 +370,9 @@ async def robinhood_initiate(user_id: CurrentUserId, request=None):
 
     redirect_uri = f"{SERVER_BASE_URL.rstrip('/')}/api/v1/oauth/robinhood/callback"
 
+    # Capture frontend origin so the callback can redirect back to it.
+    frontend_origin = request.headers.get("origin", "") if request else ""
+
     try:
         authorize_url, client_id, verifier, state = await robinhood_generate_authorize_url(
             redirect_uri
@@ -376,10 +381,14 @@ async def robinhood_initiate(user_id: CurrentUserId, request=None):
         logger.error(f"[oauth] Robinhood initiate failed for user_id={user_id}: {e}")
         raise HTTPException(status_code=502, detail="Failed to register Robinhood OAuth client")
 
-    # Store state → {user_id, client_id, verifier} in Redis (10-min TTL)
     await cache.client.set(
         f"oauth:robinhood:state:{state}",
-        json.dumps({"user_id": user_id, "client_id": client_id, "verifier": verifier}),
+        json.dumps({
+            "user_id": user_id,
+            "client_id": client_id,
+            "verifier": verifier,
+            "frontend_origin": frontend_origin,
+        }),
         ex=600,
     )
 
@@ -389,63 +398,46 @@ async def robinhood_initiate(user_id: CurrentUserId, request=None):
 
 # ─── Callback (browser redirect) ─────────────────────────────────────────────
 
-_CALLBACK_SUCCESS_HTML = """<!DOCTYPE html>
-<html><head><title>Connected</title></head><body>
-<p>Robinhood connected! You can close this tab.</p>
-<script>
-  if (window.opener) {{
-    window.opener.postMessage({{type: "robinhood_oauth_success"}}, "*");
-    window.close();
-  }}
-</script>
-</body></html>"""
-
-_CALLBACK_ERROR_HTML = """<!DOCTYPE html>
-<html><head><title>Error</title></head><body>
-<p>Authorization failed: {error}</p>
-<script>
-  if (window.opener) {{
-    window.opener.postMessage({{type: "robinhood_oauth_error", error: "{error}"}}, "*");
-    window.close();
-  }}
-</script>
-</body></html>"""
-
-
 @router.get("/robinhood/callback", include_in_schema=False)
 async def robinhood_callback(code: str | None = None, state: str | None = None, error: str | None = None):
     """Handle Robinhood's redirect after user authorization.
 
-    This is a browser-facing endpoint (no auth header). Uses state to look up
-    the pending session from Redis, exchanges the code for tokens, then returns
-    an HTML page that notifies the opener window and closes itself.
+    Exchanges the code for tokens, then redirects the popup to the frontend's
+    /oauth/robinhood/callback page (same origin as opener) so BroadcastChannel
+    communication works reliably.
     """
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import RedirectResponse
     from src.config.env import SERVER_BASE_URL
     from src.utils.cache.redis_cache import get_cache_client
 
-    def error_page(msg: str) -> HTMLResponse:
-        return HTMLResponse(_CALLBACK_ERROR_HTML.format(error=msg), status_code=400)
+    cache = get_cache_client()
+
+    def frontend_redirect(origin: str, status: str, error_msg: str = "") -> RedirectResponse:
+        params: dict[str, str] = {"status": status}
+        if error_msg:
+            params["error"] = error_msg
+        base = origin.rstrip("/") if origin else SERVER_BASE_URL.rstrip("/")
+        return RedirectResponse(f"{base}/oauth/robinhood/callback?{urllib.parse.urlencode(params)}")
 
     if error:
         logger.warning(f"[oauth] Robinhood callback error: {error}")
-        return error_page(error)
+        return frontend_redirect("", "error", error)
 
     if not code or not state:
-        return error_page("Missing code or state parameter")
+        return frontend_redirect("", "error", "Missing code or state parameter")
 
-    cache = get_cache_client()
     if not cache.enabled or not cache.client:
-        return error_page("Cache unavailable")
+        return frontend_redirect("", "error", "Cache unavailable")
 
     raw = await cache.client.get(f"oauth:robinhood:state:{state}")
     if not raw:
-        return error_page("Unknown or expired state. Please try connecting again.")
+        return frontend_redirect("", "error", "Unknown or expired state. Please try connecting again.")
 
     session = json.loads(raw)
-    user_id   = session["user_id"]
-    client_id = session["client_id"]
-    verifier  = session["verifier"]
+    user_id         = session["user_id"]
+    client_id       = session["client_id"]
+    verifier        = session["verifier"]
+    frontend_origin = session.get("frontend_origin", "")
 
     redirect_uri = f"{SERVER_BASE_URL.rstrip('/')}/api/v1/oauth/robinhood/callback"
 
@@ -453,7 +445,7 @@ async def robinhood_callback(code: str | None = None, state: str | None = None, 
         tokens = await robinhood_exchange_code(code, verifier, client_id, redirect_uri)
     except Exception as e:
         logger.error(f"[oauth] Robinhood token exchange failed for user_id={user_id}: {e}")
-        return error_page("Token exchange failed. Please try again.")
+        return frontend_redirect(frontend_origin, "error", "Token exchange failed. Please try again.")
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=tokens.get("expires_in", 86400))
@@ -463,7 +455,7 @@ async def robinhood_callback(code: str | None = None, state: str | None = None, 
         provider=ROBINHOOD_PROVIDER,
         access_token=tokens["access_token"],
         refresh_token=tokens["refresh_token"],
-        account_id=client_id,  # stored for use during token refresh
+        account_id=client_id,
         email=None,
         plan_type=None,
         expires_at=expires_at,
@@ -477,7 +469,7 @@ async def robinhood_callback(code: str | None = None, state: str | None = None, 
     await cache.client.delete(f"oauth:robinhood:state:{state}")
 
     logger.info(f"[oauth] Robinhood connected for user_id={user_id}")
-    return HTMLResponse(_CALLBACK_SUCCESS_HTML)
+    return frontend_redirect(frontend_origin, "success")
 
 
 # ─── Status ──────────────────────────────────────────────────────────────────
